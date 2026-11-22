@@ -1,0 +1,67 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signed() { return request.auth != null; }
+    function roomData(id) { return get(/databases/$(database)/documents/rooms/$(id)).data; }
+    function member(id) { return signed() && (request.auth.uid == roomData(id).host || request.auth.uid == roomData(id).guest); }
+    function both(id) {
+      let r = roomData(id);
+      let round = get(/databases/$(database)/documents/rooms/$(id)/rounds/current).data;
+      return r.guest is string && round.submitted.get(r.host, false) == true && round.submitted.get(r.guest, false) == true;
+    }
+    match /rooms/{id} {
+      allow create: if signed() && id.matches('[0-9A-F]{18}')
+        && request.resource.data.keys().hasOnly(['host','guest','hostName','guestName','createdAt'])
+        && request.resource.data.host == request.auth.uid
+        && request.resource.data.guest == null
+        && request.resource.data.hostName is string && request.resource.data.hostName.size() <= 25
+        && request.resource.data.guestName == '';
+      // Reading a room requires its unguessable invitation code; do not share codes publicly.
+      allow get: if signed();
+      allow list: if false;
+      allow update: if signed() && resource.data.guest == null
+        && request.auth.uid != resource.data.host
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['guest','guestName'])
+        && request.resource.data.guest == request.auth.uid
+        && request.resource.data.guestName is string
+        && request.resource.data.guestName.size() > 0 && request.resource.data.guestName.size() <= 25;
+      allow delete: if false;
+      match /rounds/{roundId} {
+        allow get: if roundId == 'current' && member(id);
+        allow list: if false;
+        allow create: if roundId == 'current' && member(id) && request.auth.uid == roomData(id).host
+          && roomData(id).guest is string && validRound();
+        allow update: if roundId == 'current' && member(id) && (
+          (request.auth.uid == roomData(id).host && both(id) && validRound())
+          || validSubmission(id)
+        );
+        allow delete: if false;
+        function validRound() {
+          return request.resource.data.keys().hasOnly(['deck','index','submitted','nonce','createdAt'])
+            && request.resource.data.deck is int && request.resource.data.deck >= 0 && request.resource.data.deck < 6
+            && request.resource.data.index is int && request.resource.data.index >= 0 && request.resource.data.index < 10
+            && request.resource.data.submitted == {}
+            && request.resource.data.nonce is string && request.resource.data.nonce.size() == 18;
+        }
+        function validSubmission(id) {
+          return request.resource.data.diff(resource.data).affectedKeys().hasOnly(['submitted'])
+            && request.resource.data.submitted.diff(resource.data.submitted).affectedKeys().hasOnly([request.auth.uid])
+            && resource.data.submitted.get(request.auth.uid, false) != true
+            && request.resource.data.submitted[request.auth.uid] == true
+            && existsAfter(/databases/$(database)/documents/rooms/$(id)/rounds/current/answers/$(resource.data.nonce + "_" + request.auth.uid));
+        }
+        match /answers/{answerUid} {
+          allow get: if member(id) && (answerUid == get(/databases/$(database)/documents/rooms/$(id)/rounds/current).data.nonce + "_" + request.auth.uid || (both(id) && (answerUid == get(/databases/$(database)/documents/rooms/$(id)/rounds/current).data.nonce + "_" + roomData(id).host || answerUid == get(/databases/$(database)/documents/rooms/$(id)/rounds/current).data.nonce + "_" + roomData(id).guest)));
+          allow list: if false;
+          allow create: if member(id) && answerUid == get(/databases/$(database)/documents/rooms/$(id)/rounds/current).data.nonce + "_" + request.auth.uid
+                        && request.resource.data.keys().hasOnly(['text','skipped','nonce','owner'])
+            && request.resource.data.owner == request.auth.uid
+            && request.resource.data.nonce == get(/databases/$(database)/documents/rooms/$(id)/rounds/current).data.nonce
+            && request.resource.data.text is string && request.resource.data.text.size() <= 2000
+            && request.resource.data.skipped is bool;
+          allow update, delete: if false;
+        }
+      }
+    }
+  }
+}
